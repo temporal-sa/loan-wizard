@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+
+# Node / Vite (web interface)
+node_modules/
+dist/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+.ruff_cache/
+.claude/
+# Note: uv.lock is committed on purpose to pin the reference build.
