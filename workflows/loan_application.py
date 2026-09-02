@@ -15,6 +15,7 @@ with workflow.unsafe.imports_passed_through():
         SubmitStepInput, SaveDraftInput, ResolveReviewInput,
     )
     from shared.wizard import STEP_ORDER, validate_step, next_step, coerce_step
+    from shared.search_attributes import LOAN_STATUS, LOAN_USER_ID
 
 ABANDON_AFTER = timedelta(days=7)
 MAX_REMINDERS = 2
@@ -41,6 +42,28 @@ class LoanApplicationWorkflow:
         # a resolve_review Update lands; while None (and status is manual_review)
         # the Workflow stays alive, parked, waiting to be resolved.
         self._resolution: LoanDecision | None = None
+        # The user id (applicant email) last mirrored to the LoanUserId Search
+        # Attribute, so we only upsert when it first appears or changes.
+        self._indexed_user_id: str | None = None
+
+    def _apply_status(self, status: str) -> None:
+        """Set the lifecycle status AND mirror it to the LoanStatus Search
+        Attribute so reviewers can filter applications by status in the Temporal
+        UI/CLI. The single writer of `self._state.status`, so the queryable state
+        and the indexed attribute can never drift apart."""
+        self._state.status = status
+        workflow.upsert_search_attributes([LOAN_STATUS.value_set(status)])
+
+    def _index_user_from_email(self) -> None:
+        """Mirror the applicant's email to the LoanUserId Search Attribute once
+        it is known, so a reviewer can find every application belonging to a
+        person. Idempotent: only upserts when the email first appears or changes,
+        and does nothing until the applicant step carries an email."""
+        applicant = self._state.data.applicant or {}
+        email = applicant.get("email")
+        if email and email != self._indexed_user_id:
+            self._indexed_user_id = email
+            workflow.upsert_search_attributes([LOAN_USER_ID.value_set(email)])
 
     @workflow.run
     async def run(
@@ -55,6 +78,11 @@ class LoanApplicationWorkflow:
         # continue-as-new) can run before this body, so its newer write wins.
         self._state.application_id = application_id
         self._state.updated_at = workflow.now().timestamp()
+        # Publish the current status as a Search Attribute from the first Task, so
+        # a fresh application is filterable as in_progress immediately (and a run
+        # resumed via continue-as-new re-affirms it). Search Attributes carry
+        # across continue-as-new, so this is a cheap re-write, not a fix-up.
+        self._apply_status(self._state.status)
         if completed:
             # Union with whatever a handler already recorded, in canonical order.
             resumed = set(self._state.completed_steps) | set(completed)
@@ -72,6 +100,8 @@ class LoanApplicationWorkflow:
                     self._state.data, field,
                     incoming if existing is None else {**incoming, **existing},
                 )
+        # A resumed run may carry the applicant email — index it up front.
+        self._index_user_from_email()
 
         # Resumable wait loop with inactivity reminders. The reminder count is
         # carried across continue-as-new (see below), so the abandonment budget
@@ -97,7 +127,7 @@ class LoanApplicationWorkflow:
                     decision = LoanDecision(
                         outcome="abandoned", reason="Inactive", reference_id=application_id,
                     )
-                    self._state.status = "abandoned"
+                    self._apply_status("abandoned")
                     self._state.decision = decision
                     self._state.updated_at = workflow.now().timestamp()
                     return decision
@@ -135,13 +165,13 @@ class LoanApplicationWorkflow:
                 reason=self._withdraw_reason or "Withdrawn by applicant",
                 reference_id=application_id,
             )
-            self._state.status = "withdrawn"
+            self._apply_status("withdrawn")
             self._state.decision = decision
             self._state.updated_at = workflow.now().timestamp()
             return decision
 
         # Submitted, so run the decisioning Saga.
-        self._state.status = "processing"
+        self._apply_status("processing")
         self._state.updated_at = workflow.now().timestamp()
         decision = await self._run_decisioning(application_id)
 
@@ -160,7 +190,7 @@ class LoanApplicationWorkflow:
         # the applicant withdraws). This is the whole point of the pattern: a
         # long-lived Workflow that is continued and updated while it runs.
         if decision.outcome == "manual_review":
-            self._state.status = "manual_review"
+            self._apply_status("manual_review")
             self._state.decision = decision
             self._state.updated_at = workflow.now().timestamp()
             await workflow.wait_condition(
@@ -185,7 +215,7 @@ class LoanApplicationWorkflow:
                 start_to_close_timeout=ACT_TIMEOUT,
             )
 
-        self._state.status = decision.outcome
+        self._apply_status(decision.outcome)
         self._state.decision = decision
         self._state.updated_at = workflow.now().timestamp()
 
@@ -203,6 +233,7 @@ class LoanApplicationWorkflow:
         current = getattr(self._state.data, draft.step.value) or {}
         partial = coerce_step(draft.step, draft.partial)
         setattr(self._state.data, draft.step.value, {**current, **partial})
+        self._index_user_from_email()
         self._state.updated_at = workflow.now().timestamp()
 
     # Signal: the applicant withdraws.
@@ -210,7 +241,7 @@ class LoanApplicationWorkflow:
     def withdraw(self, reason: str | None = None) -> None:
         self._withdrawn = True
         self._withdraw_reason = reason
-        self._state.status = "withdrawn"
+        self._apply_status("withdrawn")
         self._state.updated_at = workflow.now().timestamp()
 
     # Update: submit a step, validated and synchronous.
@@ -220,6 +251,7 @@ class LoanApplicationWorkflow:
         if inp.step not in self._state.completed_steps:
             self._state.completed_steps.append(inp.step)
         self._state.current_step = next_step(inp.step) or inp.step
+        self._index_user_from_email()
         self._state.updated_at = workflow.now().timestamp()
         return self._state
 
@@ -237,7 +269,7 @@ class LoanApplicationWorkflow:
     @workflow.update
     async def submit_application(self) -> WizardState:
         self._submitted = True
-        self._state.status = "submitted"
+        self._apply_status("submitted")
         self._state.updated_at = workflow.now().timestamp()
         return self._state
 

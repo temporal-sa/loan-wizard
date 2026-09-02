@@ -411,6 +411,13 @@ class ResolveReviewInput(BaseModel):
 
 These models give one source of truth for the wizard's shape. FastAPI validates incoming request bodies against them, and the Pydantic data converter serializes `WizardState` and `LoanDecision` across the Temporal boundary.
 
+> **Production note — protect PII in the Event History** The wizard collects personal data: name, email, date of birth, employer, and income. The Pydantic data converter serializes `WizardState` — including that data — into the Temporal Event History, so a production deployment would durably store this PII in the Cluster (as base64-encoded JSON, not encrypted). Before productionizing this application you need to protect this data in one of two ways:
+>
+> - **Encrypt payloads with a codec** Compose an encryption `PayloadCodec` into the Data Converter so every Payload is encrypted at rest (using keys you own) in the Event History and the Cluster only ever sees encrypted bytes, then run a Codec Server so authorized users can still decode inputs, outputs, and history in the Web UI and CLI. Because this reference already centralizes the Data Converter in `shared/temporal.py`, the codec plugs in there without touching the core of the Workflow.
+> - **Keep PII out of Temporal with the claim-check pattern** Store the personal data in your own encrypted store keyed by `application_id` and carry only a synthetic key in `WizardData`, so no PII ever enters the Event History. Prefer this method when a compliance boundary requires that the Cluster never hold the data. NOTE: This is a larger change since the Activities become responsible for reading and writing the external store.
+>
+> See the encryption and claim-check links under [Related resources](#related-resources) for implementation guides and a runnable Python sample.
+
 ### Add the pure validation logic
 
 Validation lives in its own module so the Update validator and the unit tests can share it. The functions perform no input or output and change no state.
@@ -1345,7 +1352,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-Register the same Pydantic data converter on both the client and the Worker, or the models will not deserialize.
+Register the same Pydantic data converter on both the client and the Worker, or the models will not deserialize. Centralizing it in `shared/temporal.py` also gives you one place to add encryption: attach an encryption `PayloadCodec` to that Data Converter, and every Client and Worker Payload (including the PII in `WizardState`) is encrypted before it reaches the Cluster. See the [Production note on protecting PII](#define-the-shared-models) and [Related resources](#related-resources).
 
 ### Expose the API with FastAPI
 
@@ -1576,8 +1583,11 @@ By following this implementation plan, you have built a resumable, multi-step wi
 - Run the same code locally or on Temporal Cloud through environment variables, with mocked, idempotent Activities.
 
 ## Related resources
-
+- [Source Code](https://github.com/temporal-sa/loan-wizard)
 - [Temporal documentation on workflow message passing](https://docs.temporal.io/encyclopedia/workflow-message-passing) covers how Signals, Queries, and Updates send data to and read state from a running Workflow.
 - [Temporal documentation on Continue-As-New](https://docs.temporal.io/workflow-execution/continue-as-new) explains how to keep Event History bounded on long-lived Workflows.
 - [Temporal blog post on the Saga pattern](https://temporal.io/blog/saga-pattern-made-easy) shows how to model compensations for a multi-step process inside a Workflow.
 - [Temporal documentation on testing Python Workflows](https://docs.temporal.io/develop/python/best-practices/testing-suite) describes the test environment, time-skipping, and the Replayer for determinism checks.
+- [Codecs and encryption](https://docs.temporal.io/production-deployment/data-encryption) and the [Codec Server](https://docs.temporal.io/codec-server) explain how to encrypt Payloads at rest in the Event History and still decode them for authorized viewing. This is to protect the PII this wizard collects (see the Production note under [Define the shared models](#define-the-shared-models)).
+- [Data handling with the Python SDK](https://docs.temporal.io/develop/python/converters-and-encryption) shows how to compose a custom `PayloadCodec` into the Data Converter, and the [Python encryption sample](https://github.com/temporalio/samples-python/tree/main/encryption) is a runnable end-to-end example with a Codec Server.
+- [Claim check pattern (Python)](https://docs.temporal.io/ai-cookbook/claim-check-pattern-python) and [External Storage](https://docs.temporal.io/develop/python/data-handling/external-storage) show how to keep large or sensitive Payloads out of the Event History by storing them externally and passing only a reference. This is the alternative to encryption when PII must never reach the Cluster.

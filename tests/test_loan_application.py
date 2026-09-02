@@ -27,6 +27,8 @@ from shared.models import (
     SubmitStepInput,
     WizardData,
 )
+from shared.search_attributes import LOAN_STATUS, LOAN_USER_ID
+from shared.temporal import register_search_attributes
 from workflows.loan_application import LoanApplicationWorkflow, MAX_REMINDERS
 
 TASK_QUEUE = "test-loan-applications"
@@ -47,6 +49,9 @@ async def client():
     async with await WorkflowEnvironment.start_local(
         data_converter=pydantic_data_converter
     ) as env:
+        # The Workflow upserts custom Search Attributes; they must be registered
+        # on this ephemeral Cluster first or every Task fails and retries forever.
+        await register_search_attributes(env.client)
         with ThreadPoolExecutor(max_workers=10) as executor:
             async with Worker(
                 env.client,
@@ -76,6 +81,23 @@ async def _wait_for_status(handle, statuses, *, tries=50):
             return state
         await asyncio.sleep(0.1)
     raise AssertionError(f"status never reached {statuses}; last was {state and state.status}")
+
+
+async def _wait_for_sa(handle, key, expected, *, tries=50):
+    """Poll describe() until a custom Search Attribute reaches `expected`.
+
+    An upsert is applied when its Workflow Task completes and takes a moment to
+    surface through describe(), so a short poll avoids a flaky read.
+    """
+    value = None
+    for _ in range(tries):
+        value = (await handle.describe()).typed_search_attributes.get(key)
+        if value == expected:
+            return
+        await asyncio.sleep(0.1)
+    raise AssertionError(
+        f"search attribute {key.name} never became {expected!r}; last was {value!r}"
+    )
 
 
 async def _drive_to_decision(handle):
@@ -182,6 +204,7 @@ async def test_inactivity_sends_reminders_then_abandons():
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
     ) as env:
+        await register_search_attributes(env.client)
         with ThreadPoolExecutor(max_workers=4) as executor:
             async with Worker(
                 env.client,
@@ -233,6 +256,7 @@ async def test_decision_engine_failure_runs_compensation():
     async with await WorkflowEnvironment.start_local(
         data_converter=pydantic_data_converter
     ) as env:
+        await register_search_attributes(env.client)
         with ThreadPoolExecutor(max_workers=10) as executor:
             async with Worker(
                 env.client,
@@ -284,6 +308,7 @@ async def test_carried_reminder_count_is_honored_after_continue_as_new():
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
     ) as env:
+        await register_search_attributes(env.client)
         with ThreadPoolExecutor(max_workers=4) as executor:
             async with Worker(
                 env.client,
@@ -330,6 +355,7 @@ async def test_busy_autosave_continues_as_new_without_waiting_for_timeout():
             "limit.historyCount.suggestContinueAsNew=50",
         ],
     ) as env:
+        await register_search_attributes(env.client)
         with ThreadPoolExecutor(max_workers=4) as executor:
             async with Worker(
                 env.client,
@@ -550,6 +576,32 @@ async def test_resolve_review_rejected_before_manual_review(client):
     # Clean up: withdraw so the Workflow completes instead of lingering.
     await handle.signal(LoanApplicationWorkflow.withdraw)
     await handle.result()
+
+
+async def test_search_attributes_track_status_and_user(client):
+    """LoanStatus mirrors the lifecycle status and LoanUserId mirrors the
+    applicant email, so a reviewer can filter applications by status and by user.
+    """
+    handle = await _start(client, "app-sa")
+
+    # in_progress is published from the first Workflow Task, before any step.
+    await _wait_for_sa(handle, LOAN_STATUS, "in_progress")
+
+    # The applicant's email is indexed as the user id once step 1 is submitted.
+    step, payload = VALID_STEPS[0]
+    await handle.execute_update(
+        LoanApplicationWorkflow.submit_step,
+        SubmitStepInput(step=step, payload=payload),
+    )
+    await _wait_for_sa(handle, LOAN_USER_ID, payload["email"])
+
+    # Driving to a terminal decision moves LoanStatus to the final outcome.
+    await _drive_to_decision(handle)
+    decision = await handle.result()
+    await _wait_for_sa(handle, LOAN_STATUS, decision.outcome)
+    # The user id persists on the completed application.
+    final = await handle.describe()
+    assert final.typed_search_attributes.get(LOAN_USER_ID) == payload["email"]
 
 
 async def test_resolve_review_rejects_invalid_outcome(client):

@@ -25,6 +25,7 @@ from temporalio.worker import Worker
 
 from activities import loan_activities
 from shared.models import LoanStep, ResolveReviewInput, SubmitStepInput
+from shared.temporal import register_search_attributes
 from workflows.loan_application import LoanApplicationWorkflow
 
 TASK_QUEUE = "gen-history"
@@ -44,6 +45,7 @@ async def main() -> None:
     async with await WorkflowEnvironment.start_local(
         data_converter=pydantic_data_converter
     ) as env:
+        await register_search_attributes(env.client)
         with ThreadPoolExecutor(max_workers=10) as executor:
             async with Worker(
                 env.client,

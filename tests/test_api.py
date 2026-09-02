@@ -19,6 +19,7 @@ import api.temporal_client as temporal_client
 from activities import loan_activities
 from api.main import app
 from shared.models import LoanStep
+from shared.temporal import register_search_attributes
 from workflows.loan_application import LoanApplicationWorkflow
 
 ALL_ACTIVITIES = loan_activities.ALL
@@ -41,6 +42,7 @@ async def test_full_rest_flow_and_invalid_step_returns_422():
     ) as env:
         # Point the API's client singleton at the test server.
         temporal_client._client = env.client
+        await register_search_attributes(env.client)
         try:
             with ThreadPoolExecutor(max_workers=10) as executor:
                 async with Worker(
@@ -124,6 +126,7 @@ async def test_save_draft_is_accepted_as_fire_and_forget():
         data_converter=pydantic_data_converter
     ) as env:
         temporal_client._client = env.client
+        await register_search_attributes(env.client)
         try:
             with ThreadPoolExecutor(max_workers=10) as executor:
                 async with Worker(
@@ -167,6 +170,7 @@ async def _rest_env():
         data_converter=pydantic_data_converter
     ) as env:
         temporal_client._client = env.client
+        await register_search_attributes(env.client)
         try:
             with ThreadPoolExecutor(max_workers=10) as executor:
                 async with Worker(
