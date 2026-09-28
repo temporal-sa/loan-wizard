@@ -158,7 +158,10 @@ export function Wizard({ applicationId }: { applicationId: string }) {
         // a transient 5xx) is expected — keep polling. But don't spin forever:
         // after repeated failures, surface the error and stop.
         console.warn(
-          `Polling ${applicationId} failed (${failures}/${MAX_POLL_FAILURES})`,
+          "Polling %s failed (%d/%d)",
+          applicationId,
+          failures,
+          MAX_POLL_FAILURES,
           err,
         );
         if (failures >= MAX_POLL_FAILURES) {
