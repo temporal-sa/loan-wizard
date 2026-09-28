@@ -11,7 +11,7 @@ with workflow.unsafe.imports_passed_through():
         run_decision_engine, notify_applicant, send_reminder,
     )
     from shared.models import (
-        WizardState, WizardData, LoanDecision, LoanStep,
+        WizardState, WizardData, LoanDecision, LoanStep, ApplicationStatus,
         SubmitStepInput, SaveDraftInput, ResolveReviewInput,
     )
     from shared.wizard import STEP_ORDER, validate_step, next_step, coerce_step
@@ -29,7 +29,7 @@ class LoanApplicationWorkflow:
         # run before run()'s body, so the state it reads must already exist.
         self._state = WizardState(
             application_id="",
-            status="in_progress",
+            status=ApplicationStatus.in_progress,
             current_step=LoanStep.applicant,
             completed_steps=[],
             data=WizardData(),
@@ -46,12 +46,14 @@ class LoanApplicationWorkflow:
         # Attribute, so we only upsert when it first appears or changes.
         self._indexed_user_id: str | None = None
 
-    def _apply_status(self, status: str) -> None:
+    def _apply_status(self, status: ApplicationStatus) -> None:
         """Set the lifecycle status AND mirror it to the LoanStatus Search
         Attribute so reviewers can filter applications by status in the Temporal
         UI/CLI. The single writer of `self._state.status`, so the queryable state
         and the indexed attribute can never drift apart."""
         self._state.status = status
+        # value_set takes the Enum member directly: it is a str, so it encodes to
+        # the plain keyword ("approved", …) the Cluster expects.
         workflow.upsert_search_attributes([LOAN_STATUS.value_set(status)])
 
     def _index_user_from_email(self) -> None:
@@ -125,11 +127,26 @@ class LoanApplicationWorkflow:
                 if reminders >= MAX_REMINDERS:
                     await workflow.wait_condition(workflow.all_handlers_finished)
                     decision = LoanDecision(
-                        outcome="abandoned", reason="Inactive", reference_id=application_id,
+                        outcome=ApplicationStatus.abandoned, reason="Inactive",
+                        reference_id=application_id,
                     )
-                    self._apply_status("abandoned")
+                    self._apply_status(ApplicationStatus.abandoned)
                     self._state.decision = decision
                     self._state.updated_at = workflow.now().timestamp()
+                    # Tell the applicant the application lapsed, so abandonment
+                    # is announced like every other terminal outcome. Fired
+                    # after the status is applied and outside any Saga: the
+                    # inactivity timer decided this locally, there is nothing to
+                    # roll back, and a failed notification must not unwind a
+                    # terminal state the Query already reports.
+                    await workflow.execute_activity(
+                        notify_applicant, args=[application_id, decision],
+                        start_to_close_timeout=ACT_TIMEOUT,
+                    )
+                    # Awaiting the Activity reopens the window in which a late
+                    # Update or Signal handler can start, so drain once more
+                    # before completing.
+                    await workflow.wait_condition(workflow.all_handlers_finished)
                     return decision
                 reminders += 1
                 email = self._state.data.applicant.get("email") if self._state.data.applicant else None
@@ -161,17 +178,17 @@ class LoanApplicationWorkflow:
         if self._withdrawn:
             await workflow.wait_condition(workflow.all_handlers_finished)
             decision = LoanDecision(
-                outcome="withdrawn",
+                outcome=ApplicationStatus.withdrawn,
                 reason=self._withdraw_reason or "Withdrawn by applicant",
                 reference_id=application_id,
             )
-            self._apply_status("withdrawn")
+            self._apply_status(ApplicationStatus.withdrawn)
             self._state.decision = decision
             self._state.updated_at = workflow.now().timestamp()
             return decision
 
         # Submitted, so run the decisioning Saga.
-        self._apply_status("processing")
+        self._apply_status(ApplicationStatus.processing)
         self._state.updated_at = workflow.now().timestamp()
         decision = await self._run_decisioning(application_id)
 
@@ -189,8 +206,8 @@ class LoanApplicationWorkflow:
         # updated — an underwriter resolves it with a resolve_review Update (or
         # the applicant withdraws). This is the whole point of the pattern: a
         # long-lived Workflow that is continued and updated while it runs.
-        if decision.outcome == "manual_review":
-            self._apply_status("manual_review")
+        if decision.outcome == ApplicationStatus.manual_review:
+            self._apply_status(ApplicationStatus.manual_review)
             self._state.decision = decision
             self._state.updated_at = workflow.now().timestamp()
             await workflow.wait_condition(
@@ -198,7 +215,7 @@ class LoanApplicationWorkflow:
             )
             if self._withdrawn:
                 decision = LoanDecision(
-                    outcome="withdrawn",
+                    outcome=ApplicationStatus.withdrawn,
                     reason=self._withdraw_reason or "Withdrawn by applicant",
                     reference_id=application_id,
                 )
@@ -241,7 +258,7 @@ class LoanApplicationWorkflow:
     def withdraw(self, reason: str | None = None) -> None:
         self._withdrawn = True
         self._withdraw_reason = reason
-        self._apply_status("withdrawn")
+        self._apply_status(ApplicationStatus.withdrawn)
         self._state.updated_at = workflow.now().timestamp()
 
     # Update: submit a step, validated and synchronous.
@@ -269,7 +286,7 @@ class LoanApplicationWorkflow:
     @workflow.update
     async def submit_application(self) -> WizardState:
         self._submitted = True
-        self._apply_status("submitted")
+        self._apply_status(ApplicationStatus.submitted)
         self._state.updated_at = workflow.now().timestamp()
         return self._state
 
@@ -302,7 +319,7 @@ class LoanApplicationWorkflow:
     @resolve_review.validator
     def _validate_resolve_review(self, inp: ResolveReviewInput) -> None:
         # Validators must be read-only: no Activities, no sleeps, no changes. Raise to reject.
-        if self._state.status != "manual_review" or self._resolution is not None:
+        if self._state.status != ApplicationStatus.manual_review or self._resolution is not None:
             raise ApplicationError(
                 "Application is not awaiting manual review",
                 {"status": self._state.status},
@@ -351,6 +368,10 @@ class LoanApplicationWorkflow:
                     except Exception as ce:
                         workflow.logger.error(f"compensation failed: {ce}")
 
-            # asyncio.shield runs the compensations even if the Workflow is cancelled.
+            # asyncio.shield lets the compensations finish even if the Workflow is
+            # cancelled mid-Saga: a Cancellation is delivered to the Worker as a
+            # Workflow Task, so shielded code still runs. It cannot help on a
+            # Terminate, which closes the Execution server-side with no Workflow
+            # Task at all — nothing here runs, and compensations are skipped.
             await asyncio.shield(asyncio.ensure_future(_compensate()))
             raise

@@ -1,6 +1,6 @@
 # activities/loan_activities.py
 from temporalio import activity
-from shared.models import WizardData, LoanDecision
+from shared.models import WizardData, LoanDecision, ApplicationStatus
 
 
 def _score(application_id: str) -> int:
@@ -32,12 +32,12 @@ def run_decision_engine(application_id: str, data: WizardData, score: int) -> Lo
     amount = (data.loan_details or {}).get("amount", 0) or 0
     if score >= 720 and amount <= income:
         return LoanDecision(
-            outcome="approved", reason="Strong credit and affordable amount",
+            outcome=ApplicationStatus.approved, reason="Strong credit and affordable amount",
             reference_id=application_id,
         )
     if score < 600:
         return LoanDecision(
-            outcome="rejected", reason="Credit score below threshold",
+            outcome=ApplicationStatus.rejected, reason="Credit score below threshold",
             reference_id=application_id,
         )
     # Manual review: state the actual trigger so the underwriter (and the
@@ -48,7 +48,7 @@ def run_decision_engine(application_id: str, data: WizardData, score: int) -> Lo
     else:
         reason = f"Credit score {score} is in the manual-review band (600–719)"
     return LoanDecision(
-        outcome="manual_review", reason=reason, reference_id=application_id,
+        outcome=ApplicationStatus.manual_review, reason=reason, reference_id=application_id,
     )
 
 

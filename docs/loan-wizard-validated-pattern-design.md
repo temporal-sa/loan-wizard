@@ -62,7 +62,7 @@ For submitting a step, though, the right primitive is an Update, not a Signal:
 A Signal is fire-and-forget, so the sender receives no return value and no validation result.
 A Signal cannot report whether the Workflow accepted the step.
 To find out, you would submit the step with a Signal and then poll with a separate Query.
-That extra poll is the workaround that Update replaces, because Update returns a result directly.
+An Update eliminates the extra Query call, because Update returns a result directly.
 An Update validator runs before the Update enters history and must be read-only, which fits synchronous step validation.
 One useful property follows from this.
 Temporal does not record validation-rejected Updates in Event History, so failed attempts do not bloat the log.
@@ -102,6 +102,10 @@ So save a draft only after the applicant pauses typing, not on every keystroke, 
 
 Activities must be idempotent, keyed by `application_id`, so that Temporal can retry them after a failure without double-charging or double-notifying the applicant.
 
+## Possible upgrades
+
+If you have requirements to handle large payloads in your Workflows and/or Activities, then reference the [Large Payload] (https://docs.temporal.io/external-storage) feature.
+
 ## Target audience
 
 This pattern references the following roles:
@@ -119,7 +123,7 @@ This implementation requires code changes, Temporal Worker configuration, and ap
   - The [Temporal Python software development kit (SDK)](https://github.com/temporalio/sdk-python), `temporalio`, plus [FastAPI](https://fastapi.tiangolo.com/), [uvicorn](https://www.uvicorn.org/), and [Pydantic](https://docs.pydantic.dev/) for the API layer.
   - The [Temporal command-line interface](https://docs.temporal.io/cli) for the local development server.
   - [Node.js](https://nodejs.org/) 18 or later for the [React](https://react.dev/) interface only.
-  - A Temporal Cluster, either the local development server (`temporal server start-dev`) or Temporal Cloud. This pattern uses no Cloud-specific features, so the same code runs against either through environment variables.
+  - A Temporal Cluster, either the local development server (`temporal server start-dev`) or Temporal Cloud.
 ### Resources and access 
   - No external accounts. All loan-domain integrations, including credit, underwriting, and notifications, are mocked. The focus is the interaction pattern, not a working lender.
 ### Required concepts 
@@ -167,6 +171,7 @@ flowchart LR
 stateDiagram-v2
   [*] --> InProgress: start workflow
   InProgress --> InProgress: submit_step (Update)
+  InProgress --> InProgress: save_draft (Signal)
   InProgress --> Submitted: submit_application (Update)
   InProgress --> Withdrawn: withdraw (Signal)
   InProgress --> Abandoned: inactivity timeout
@@ -181,16 +186,33 @@ stateDiagram-v2
   Rejected --> [*]
   Withdrawn --> [*]
   Abandoned --> [*]
+
+  note right of InProgress
+    save_draft changes the wizard data
+    but never the status, so it is drawn
+    as a self-transition.
+  end note
+
+  note right of Processing
+    get_state (Query) reads every state
+    above and changes none, so it appears
+    on no edge. It is how the interface
+    resumes and polls, and it still answers
+    for a closed Workflow within the
+    Namespace retention period.
+  end note
 ```
 
 1. The client starts a new application, and the Workflow enters the `InProgress` state with a seven-day inactivity timeout.
 2. The applicant submits each wizard step as a validated Update. The Workflow stays in `InProgress` after each step, updating its state.
-3. When the applicant sends the final `submit_application` Update, the Workflow transitions to `Submitted` and enters the decisioning Saga, moving to `Processing`.
-4. The decisioning Saga produces one of three outcomes: `Approved`, `Rejected`, or `ManualReview`.
-5. `ManualReview` is an *interim* state, not a terminal one. The Workflow stays running and parked, awaiting an underwriter, so the application can still be updated. An underwriter finalizes it with a `resolve_review` Update (`Approved` or `Rejected`); the applicant may also `withdraw` while it is parked. This is the pattern's point: a long-lived Workflow that is continued and updated while it runs.
-6. If the applicant sends a `withdraw` Signal at any point while `InProgress` (or while parked in `ManualReview`), the Workflow transitions directly to `Withdrawn`.
-7. If the inactivity timeout fires and the maximum number of reminders has been sent, the Workflow transitions to `Abandoned`.
-8. The terminal states (`Approved`, `Rejected`, `Withdrawn`, `Abandoned`) end the Workflow Execution. `ManualReview` does not — it is resolved into `Approved` or `Rejected` first.
+3. While a step is still being filled in, a `save_draft` Signal autosaves partial input. It is drawn as a self-transition on `InProgress` because it changes the wizard *data* without changing the *status*: unlike `withdraw`, it is a Signal that moves the application through no state at all. That is also why it needs no validator — nothing downstream depends on a draft being well-formed.
+4. When the applicant sends the final `submit_application` Update, the Workflow transitions to `Submitted` and enters the decisioning Saga, moving to `Processing`.
+5. The decisioning Saga produces one of three outcomes: `Approved`, `Rejected`, or `ManualReview`.
+6. `ManualReview` is an *interim* state, not a terminal one. The Workflow stays running and parked, awaiting an underwriter, so the application can still be updated. An underwriter finalizes it with a `resolve_review` Update (`Approved` or `Rejected`); the applicant may also `withdraw` while it is parked. This is the pattern's point: a long-lived Workflow that is continued and updated while it runs.
+7. If the applicant sends a `withdraw` Signal at any point while `InProgress` (or while parked in `ManualReview`), the Workflow transitions directly to `Withdrawn`.
+8. If the inactivity timeout fires and the maximum number of reminders has been sent, the Workflow transitions to `Abandoned`, and a `notify_applicant` Activity tells the applicant the application lapsed.
+9. The `get_state` Query appears on no edge at all, which is the point of including it: it reads any state in the diagram and moves the application out of none of them. It is what restores the wizard on resume and what the interface polls while in `Processing` or `ManualReview`, and it keeps answering after a terminal state closes the Workflow, for as long as the Namespace retains the history.
+10. The terminal states (`Approved`, `Rejected`, `Withdrawn`, `Abandoned`) end the Workflow Execution. `ManualReview` does not — it is resolved into `Approved` or `Rejected` first.
 
 ### Happy path and resume
 
@@ -205,6 +227,14 @@ sequenceDiagram
   API->>WF: start_workflow (id = loan-application-{id})
   Note over WF: handlers registered, wait for submitted or withdrawn (7 days)
   API-->>U: { application_id }
+
+  rect rgb(255,248,235)
+  Note over U,WF: Autosave while typing, fire-and-forget
+  U->>API: POST /applications/{id}/draft { step, partial }
+  API-)WF: signal(save_draft)
+  Note over WF: merge partial into state, no validation, no reply
+  API-->>U: 202 Accepted (no acknowledgment from the Workflow)
+  end
 
   rect rgb(235,245,255)
   Note over U,WF: Step submission, validated and synchronous
@@ -237,12 +267,13 @@ sequenceDiagram
 
 1. The applicant starts an application with an HTTP POST request, and FastAPI starts a Workflow whose identifier encodes the application identifier.
 2. The Workflow registers its Query, Update, and Signal handlers, then waits for the applicant to submit or withdraw, with a seven-day inactivity timeout.
-3. For each step, the applicant sends an HTTP PUT request, and FastAPI sends an Update to the Workflow.
-4. The Update validator runs first and is read-only. If validation fails, the Workflow rejects the Update and the state does not change.
-5. On success, the Workflow records the step, advances the current step, and returns the updated state.
-6. When the applicant returns later, FastAPI sends a Query, and the Workflow returns the current state so the interface restores the right step with prior data.
-7. The applicant submits the application with a POST request, sent as a final Update that the validator checks for completeness and consent.
-8. The wait condition unblocks, the Workflow runs the decisioning Saga, and the applicant polls with a Query until the decision is ready.
+3. While the applicant is still filling in a step, the interface autosaves partial input with a `save_draft` Signal, sent after a pause in typing rather than on every keystroke. The Signal is fire-and-forget: the Workflow merges the partial data with no validation, sends no reply, and FastAPI answers 202 immediately. This is the right primitive precisely because a lost keystroke does not matter and the applicant should never wait on it. Each Signal is recorded in history, which is why the autosave is debounced and why the Continue-As-New guard is evaluated on every one.
+4. For each step, the applicant sends an HTTP PUT request, and FastAPI sends an Update to the Workflow.
+5. The Update validator runs first and is read-only. If validation fails, the Workflow rejects the Update and the state does not change.
+6. On success, the Workflow records the step, advances the current step, and returns the updated state.
+7. When the applicant returns later, FastAPI sends a Query, and the Workflow returns the current state so the interface restores the right step with prior data — including any autosaved partial input from step 3, so a half-finished step comes back as the applicant left it.
+8. The applicant submits the application with a POST request, sent as a final Update that the validator checks for completeness and consent.
+9. The wait condition unblocks, the Workflow runs the decisioning Saga, and the applicant polls with a Query until the decision is ready.
 
 ### Manual review resolution
 
@@ -256,7 +287,7 @@ sequenceDiagram
   participant API as FastAPI (client)
   participant WF as LoanApplicationWorkflow
 
-  Note over WF: Saga returned manual_review; status = manual_review, still running
+  Note over WF: Saga returned manual_review, status stays manual_review and the Workflow keeps running
   U->>API: GET /applications/{id} (poll)
   API->>WF: query(get_state)
   WF-->>API: interim decision (manual_review + reason)
@@ -267,8 +298,8 @@ sequenceDiagram
   UW->>API: POST /applications/{id}/review/resolve { outcome, note }
   API->>WF: execute_update(resolve_review)
   Note over WF: validator: only valid while status = manual_review
-  WF-->>API: accepted (still manual_review; finalizing)
-  Note over WF: wait condition unblocks; notify, release slot, complete
+  WF-->>API: accepted (still manual_review, finalizing)
+  Note over WF: wait condition unblocks, then notify, release slot, complete
   end
 
   U->>API: GET /applications/{id} (poll)
@@ -356,6 +387,22 @@ class LoanStep(str, Enum):
     review = "review"
 
 
+class ApplicationStatus(str, Enum):
+    # The application's lifecycle status, which is also a decision `outcome`. A
+    # `str` Enum, like LoanStep, so it serializes to a plain string across the
+    # Temporal and JSON boundaries and compares equal to its value. The first
+    # three members are in-flight-only statuses; the rest are decision outcomes —
+    # the terminal ones plus the interim manual_review.
+    in_progress = "in_progress"
+    submitted = "submitted"
+    processing = "processing"
+    manual_review = "manual_review"
+    approved = "approved"
+    rejected = "rejected"
+    withdrawn = "withdrawn"
+    abandoned = "abandoned"
+
+
 # Per-step fields (full_name/email, amount/term_months/purpose, etc.) are not
 # modeled as Pydantic types here on purpose: step data is carried as plain dicts
 # in WizardData (see below) so it crosses to the JavaScript interface as JSON,
@@ -365,8 +412,9 @@ class LoanStep(str, Enum):
 class LoanDecision(BaseModel):
     # manual_review is an *interim* outcome: the Workflow keeps running and waits
     # for an underwriter to resolve it. The terminal outcomes are approved,
-    # rejected, withdrawn, and abandoned.
-    outcome: str  # approved, rejected, manual_review, withdrawn, or abandoned
+    # rejected, withdrawn, and abandoned. Typed as ApplicationStatus, so an
+    # unknown outcome is rejected at construction.
+    outcome: ApplicationStatus
     reason: str
     reference_id: str
 
@@ -383,7 +431,7 @@ class WizardData(BaseModel):
 
 class WizardState(BaseModel):
     application_id: str
-    status: str
+    status: ApplicationStatus
     current_step: LoanStep
     completed_steps: list[LoanStep]
     data: WizardData
@@ -405,11 +453,16 @@ class SaveDraftInput(BaseModel):
 class ResolveReviewInput(BaseModel):
     # An underwriter's resolution of a manual_review application. `outcome` must
     # be "approved" or "rejected"; `note` becomes the final decision's reason.
+    # Deliberately a plain str, not ApplicationStatus: the resolve_review
+    # validator is the single gatekeeper for what an underwriter may send, so it
+    # rejects a bad value with a typed ApplicationError (mapped to 422) at the
+    # Update boundary. An Enum here would reject unknown values as a Pydantic
+    # error earlier, before that domain-specific validator.
     outcome: str
     note: str
 ```
 
-These models give one source of truth for the wizard's shape. FastAPI validates incoming request bodies against them, and the Pydantic data converter serializes `WizardState` and `LoanDecision` across the Temporal boundary.
+These models give one source of truth for the wizard's shape. FastAPI validates incoming request bodies against them, and the Pydantic data converter serializes `WizardState` and `LoanDecision` across the Temporal boundary. Because `ApplicationStatus` is a `str` Enum, it crosses both boundaries as a plain string — the interface receives `"approved"`, not an enum wrapper — so nothing on the JavaScript side changes, and a recorded history still replays.
 
 > **Production note — protect PII in the Event History** The wizard collects personal data: name, email, date of birth, employer, and income. The Pydantic data converter serializes `WizardState` — including that data — into the Temporal Event History, so a production deployment would durably store this PII in the Cluster (as base64-encoded JSON, not encrypted). Before productionizing this application you need to protect this data in one of two ways:
 >
@@ -505,7 +558,7 @@ The Activities stand in for external systems. They are idempotent and keyed by `
 ```python
 # activities/loan_activities.py
 from temporalio import activity
-from shared.models import WizardData, LoanDecision
+from shared.models import WizardData, LoanDecision, ApplicationStatus
 
 
 def _score(application_id: str) -> int:
@@ -536,12 +589,12 @@ def run_decision_engine(application_id: str, data: WizardData, score: int) -> Lo
     amount = (data.loan_details or {}).get("amount", 0) or 0
     if score >= 720 and amount <= income:
         return LoanDecision(
-            outcome="approved", reason="Strong credit and affordable amount",
+            outcome=ApplicationStatus.approved, reason="Strong credit and affordable amount",
             reference_id=application_id,
         )
     if score < 600:
         return LoanDecision(
-            outcome="rejected", reason="Credit score below threshold",
+            outcome=ApplicationStatus.rejected, reason="Credit score below threshold",
             reference_id=application_id,
         )
     # Manual review: state the actual trigger so the underwriter (and the
@@ -551,7 +604,7 @@ def run_decision_engine(application_id: str, data: WizardData, score: int) -> Lo
     else:
         reason = f"Credit score {score} is in the manual-review band (600–719)"
     return LoanDecision(
-        outcome="manual_review", reason=reason, reference_id=application_id,
+        outcome=ApplicationStatus.manual_review, reason=reason, reference_id=application_id,
     )
 
 
@@ -579,6 +632,27 @@ ALL = [
 
 Each Activity returns a small value and performs its side effect internally, which keeps payloads out of the Event History.
 
+### Define the custom Search Attributes
+
+The Workflow indexes itself with two custom Search Attributes so operators can find applications by state and by applicant. Define their typed keys once, in a module the Workflow, the Worker, and the tests all import, so the names and types cannot drift. Keep this module free of any Temporal *client* imports — it imports only `temporalio.common` — so the Workflow can import it inside `imports_passed_through()`. The registration helper, which needs a Client, lives in `shared/temporal.py` instead.
+
+```python
+# shared/search_attributes.py
+from temporalio.common import SearchAttributeKey
+
+# Keyword attributes: exact-match, low-cardinality string values — the right type
+# for a status enum and for a user identifier used in equality lookups. Names are
+# prefixed with "Loan" so they don't collide with attributes other Workflow types
+# might define in the same Namespace.
+LOAN_STATUS = SearchAttributeKey.for_keyword("LoanStatus")
+LOAN_USER_ID = SearchAttributeKey.for_keyword("LoanUserId")
+
+# Every attribute this app defines, for the one-shot Cluster registration helper.
+ALL = [LOAN_STATUS, LOAN_USER_ID]
+```
+
+A custom attribute must be registered on the Cluster before a Workflow upserts it: upserting an unregistered attribute fails the Workflow Task, which then retries indefinitely. The [Worker registers them at startup](#configure-the-worker), so a fresh development server needs no manual setup; on a locked-down Cluster such as Temporal Cloud they are registered once out-of-band with `temporal operator search-attribute create` and the startup call is a no-op.
+
 ### Implement the Workflow
 
 The Workflow is the center of the pattern. It exposes one Query, two Updates with validators, and two Signals, runs a resumable wait loop with inactivity reminders, guards history with Continue-As-New, and runs the decisioning Saga. The sections below build it up one responsibility at a time, then show the complete file.
@@ -601,10 +675,11 @@ with workflow.unsafe.imports_passed_through():
         run_decision_engine, notify_applicant, send_reminder,
     )
     from shared.models import (
-        WizardState, WizardData, LoanDecision, LoanStep,
+        WizardState, WizardData, LoanDecision, LoanStep, ApplicationStatus,
         SubmitStepInput, SaveDraftInput, ResolveReviewInput,
     )
     from shared.wizard import STEP_ORDER, validate_step, next_step, coerce_step
+    from shared.search_attributes import LOAN_STATUS, LOAN_USER_ID
 
 ABANDON_AFTER = timedelta(days=7)
 MAX_REMINDERS = 2
@@ -618,7 +693,7 @@ class LoanApplicationWorkflow:
         # run before run()'s body, so the state it reads must already exist.
         self._state = WizardState(
             application_id="",
-            status="in_progress",
+            status=ApplicationStatus.in_progress,
             current_step=LoanStep.applicant,
             completed_steps=[],
             data=WizardData(),
@@ -629,13 +704,47 @@ class LoanApplicationWorkflow:
         # An underwriter's resolution of a manual_review application; None until a
         # resolve_review Update lands, and the Workflow stays parked while it is None.
         self._resolution: LoanDecision | None = None
+        # The user id (applicant email) last mirrored to the LoanUserId Search
+        # Attribute, so we only upsert when it first appears or changes.
+        self._indexed_user_id: str | None = None
 ```
 
 The flags, not the handlers, drive the Workflow body. The handlers only set state, and the `run` method reacts to it.
 
+#### Mirroring state to Search Attributes
+
+A single running application is observable through its Query, but an operator or an underwriter rarely holds the `application_id`. In production they ask state-shaped questions — *which applications are parked in `manual_review`?*, *what has this applicant submitted before?* — and answer them across every open Workflow at once. Two custom Search Attributes make those questions first-class: `LoanStatus` tracks the lifecycle status and `LoanUserId` carries the applicant email. The Workflow upserts them as its state changes, so the same code that runs the wizard keeps the index current, and a reviewer filters in the Temporal Web UI or with `temporal workflow list --query`.
+
+Two small helpers keep that mirroring honest. `_apply_status` is the sole writer of `self._state.status`: it sets the field and upserts `LoanStatus` in one place, so the queryable state and the indexed attribute cannot drift apart. `_index_user_from_email` upserts `LoanUserId` once the applicant's email is known, and is idempotent — it upserts only when the email first appears or changes. Both take an `ApplicationStatus` or a `str` directly; because those are plain strings, `value_set` encodes them to the keyword the Cluster expects.
+
+```python
+    def _apply_status(self, status: ApplicationStatus) -> None:
+        """Set the lifecycle status AND mirror it to the LoanStatus Search
+        Attribute so reviewers can filter applications by status in the Temporal
+        UI/CLI. The single writer of `self._state.status`, so the queryable state
+        and the indexed attribute can never drift apart."""
+        self._state.status = status
+        # value_set takes the Enum member directly: it is a str, so it encodes to
+        # the plain keyword ("approved", …) the Cluster expects.
+        workflow.upsert_search_attributes([LOAN_STATUS.value_set(status)])
+
+    def _index_user_from_email(self) -> None:
+        """Mirror the applicant's email to the LoanUserId Search Attribute once
+        it is known, so a reviewer can find every application belonging to a
+        person. Idempotent: only upserts when the email first appears or changes,
+        and does nothing until the applicant step carries an email."""
+        applicant = self._state.data.applicant or {}
+        email = applicant.get("email")
+        if email and email != self._indexed_user_id:
+            self._indexed_user_id = email
+            workflow.upsert_search_attributes([LOAN_USER_ID.value_set(email)])
+```
+
+`run` upserts the status once at the top so a fresh application is filterable the moment its first Task runs, and calls `_index_user_from_email` after a resume merges carried data. From then on, every status transition goes through `_apply_status`, and the write handlers call `_index_user_from_email` after storing step data. Search Attributes carry across Continue-As-New, so a resumed run inherits the index without re-registering anything. The attributes must exist on the Cluster before the first upsert — [the Worker registers them at startup](#configure-the-worker).
+
 #### The resumable wait loop
 
-The `run` method fills in the application identity and any resumed state, in place so it does not clobber values an early handler already set, then waits for the applicant to submit or withdraw. Each timeout sends a reminder, and once history grows large enough, the Continue-As-New guard rolls the Workflow over while carrying the collected data forward.
+The `run` method fills in the application identity and any resumed state, in place so it does not clobber values an early handler already set, then waits for the applicant to submit or withdraw. Each timeout sends a reminder, and once history grows large enough, the Continue-As-New guard rolls the Workflow over while carrying the collected data forward. When the reminder budget runs out, the application is abandoned — and abandonment is announced with the same `notify_applicant` Activity as every other terminal outcome, so an applicant who walks away is told their application lapsed rather than being left to guess.
 
 ```python
     @workflow.run
@@ -651,6 +760,11 @@ The `run` method fills in the application identity and any resumed state, in pla
         # continue-as-new) can run before this body, so its newer write wins.
         self._state.application_id = application_id
         self._state.updated_at = workflow.now().timestamp()
+        # Publish the current status as a Search Attribute from the first Task, so
+        # a fresh application is filterable as in_progress immediately (and a run
+        # resumed via continue-as-new re-affirms it). Search Attributes carry
+        # across continue-as-new, so this is a cheap re-write, not a fix-up.
+        self._apply_status(self._state.status)
         if completed:
             # Union with whatever a handler already recorded, in canonical order.
             resumed = set(self._state.completed_steps) | set(completed)
@@ -668,6 +782,8 @@ The `run` method fills in the application identity and any resumed state, in pla
                     self._state.data, field,
                     incoming if existing is None else {**incoming, **existing},
                 )
+        # A resumed run may carry the applicant email — index it up front.
+        self._index_user_from_email()
 
         # Resumable wait loop with inactivity reminders. The reminder count is
         # carried across continue-as-new (see below), so the abandonment budget
@@ -691,11 +807,26 @@ The `run` method fills in the application identity and any resumed state, in pla
                 if reminders >= MAX_REMINDERS:
                     await workflow.wait_condition(workflow.all_handlers_finished)
                     decision = LoanDecision(
-                        outcome="abandoned", reason="Inactive", reference_id=application_id,
+                        outcome=ApplicationStatus.abandoned, reason="Inactive",
+                        reference_id=application_id,
                     )
-                    self._state.status = "abandoned"
+                    self._apply_status(ApplicationStatus.abandoned)
                     self._state.decision = decision
                     self._state.updated_at = workflow.now().timestamp()
+                    # Tell the applicant the application lapsed, so abandonment
+                    # is announced like every other terminal outcome. Fired
+                    # after the status is applied and outside any Saga: the
+                    # inactivity timer decided this locally, there is nothing to
+                    # roll back, and a failed notification must not unwind a
+                    # terminal state the Query already reports.
+                    await workflow.execute_activity(
+                        notify_applicant, args=[application_id, decision],
+                        start_to_close_timeout=ACT_TIMEOUT,
+                    )
+                    # Awaiting the Activity reopens the window in which a late
+                    # Update or Signal handler can start, so drain once more
+                    # before completing.
+                    await workflow.wait_condition(workflow.all_handlers_finished)
                     return decision
                 reminders += 1
                 email = self._state.data.applicant.get("email") if self._state.data.applicant else None
@@ -727,17 +858,17 @@ The `run` method fills in the application identity and any resumed state, in pla
         if self._withdrawn:
             await workflow.wait_condition(workflow.all_handlers_finished)
             decision = LoanDecision(
-                outcome="withdrawn",
+                outcome=ApplicationStatus.withdrawn,
                 reason=self._withdraw_reason or "Withdrawn by applicant",
                 reference_id=application_id,
             )
-            self._state.status = "withdrawn"
+            self._apply_status(ApplicationStatus.withdrawn)
             self._state.decision = decision
             self._state.updated_at = workflow.now().timestamp()
             return decision
 
         # Submitted, so run the decisioning Saga.
-        self._state.status = "processing"
+        self._apply_status(ApplicationStatus.processing)
         self._state.updated_at = workflow.now().timestamp()
         decision = await self._run_decisioning(application_id)
 
@@ -754,8 +885,8 @@ The `run` method fills in the application identity and any resumed state, in pla
         # interim state and keep the Workflow running so it can still be
         # updated — an underwriter resolves it with a resolve_review Update (or
         # the applicant withdraws).
-        if decision.outcome == "manual_review":
-            self._state.status = "manual_review"
+        if decision.outcome == ApplicationStatus.manual_review:
+            self._apply_status(ApplicationStatus.manual_review)
             self._state.decision = decision
             self._state.updated_at = workflow.now().timestamp()
             await workflow.wait_condition(
@@ -763,7 +894,7 @@ The `run` method fills in the application identity and any resumed state, in pla
             )
             if self._withdrawn:
                 decision = LoanDecision(
-                    outcome="withdrawn",
+                    outcome=ApplicationStatus.withdrawn,
                     reason=self._withdraw_reason or "Withdrawn by applicant",
                     reference_id=application_id,
                 )
@@ -780,7 +911,7 @@ The `run` method fills in the application identity and any resumed state, in pla
                 start_to_close_timeout=ACT_TIMEOUT,
             )
 
-        self._state.status = decision.outcome
+        self._apply_status(decision.outcome)
         self._state.decision = decision
         self._state.updated_at = workflow.now().timestamp()
 
@@ -788,7 +919,7 @@ The `run` method fills in the application identity and any resumed state, in pla
         return decision
 ```
 
-The loop waits on the same condition it breaks on, so a submit or withdraw from any handler unblocks it. When decisioning returns `manual_review`, `run` parks on a second wait condition — the Workflow keeps running, resumable and updatable, until an underwriter's `resolve_review` Update (or a `withdraw`) unblocks it. Before returning or calling Continue-As-New, it waits for in-flight handlers to finish, so it drops no Update or Signal.
+The loop waits on the same condition it breaks on, so a submit or withdraw from any handler unblocks it. When decisioning returns `manual_review`, `run` parks on a second wait condition — the Workflow keeps running, resumable and updatable, until an underwriter's `resolve_review` Update (or a `withdraw`) unblocks it. Before returning or calling Continue-As-New, it waits for in-flight handlers to finish, so it drops no Update or Signal. The abandonment branch drains twice for that reason: once before it builds the decision, and again after the `notify_applicant` Activity, because awaiting an Activity reopens the window in which a late handler can start.
 
 #### The Query and Signal handlers
 
@@ -806,6 +937,7 @@ The Query reads state for resume and polling. The Signals change state only: `sa
         current = getattr(self._state.data, draft.step.value) or {}
         partial = coerce_step(draft.step, draft.partial)
         setattr(self._state.data, draft.step.value, {**current, **partial})
+        self._index_user_from_email()
         self._state.updated_at = workflow.now().timestamp()
 
     # Signal: the applicant withdraws.
@@ -813,7 +945,7 @@ The Query reads state for resume and polling. The Signals change state only: `sa
     def withdraw(self, reason: str | None = None) -> None:
         self._withdrawn = True
         self._withdraw_reason = reason
-        self._state.status = "withdrawn"
+        self._apply_status(ApplicationStatus.withdrawn)
         self._state.updated_at = workflow.now().timestamp()
 ```
 
@@ -831,6 +963,7 @@ Each Update pairs with a read-only validator that runs before the Update enters 
         if inp.step not in self._state.completed_steps:
             self._state.completed_steps.append(inp.step)
         self._state.current_step = next_step(inp.step) or inp.step
+        self._index_user_from_email()
         self._state.updated_at = workflow.now().timestamp()
         return self._state
 
@@ -848,7 +981,7 @@ Each Update pairs with a read-only validator that runs before the Update enters 
     @workflow.update
     async def submit_application(self) -> WizardState:
         self._submitted = True
-        self._state.status = "submitted"
+        self._apply_status(ApplicationStatus.submitted)
         self._state.updated_at = workflow.now().timestamp()
         return self._state
 
@@ -879,7 +1012,7 @@ Each Update pairs with a read-only validator that runs before the Update enters 
 
     @resolve_review.validator
     def _validate_resolve_review(self, inp: ResolveReviewInput) -> None:
-        if self._state.status != "manual_review" or self._resolution is not None:
+        if self._state.status != ApplicationStatus.manual_review or self._resolution is not None:
             raise ApplicationError(
                 "Application is not awaiting manual review",
                 {"status": self._state.status},
@@ -897,7 +1030,9 @@ The `submit_step` validator delegates to the pure `validate_step` function, so t
 
 #### The decisioning Saga
 
-When the applicant submits the application, `run` calls `_run_decisioning`. Each forward Activity records a compensation first, and on any failure the compensations run in reverse under `asyncio.shield`, so they complete even if Temporal cancels the Workflow.
+When the applicant submits the application, `run` calls `_run_decisioning`. Each forward Activity records a compensation first, and on any failure the compensations run in reverse under `asyncio.shield`.
+
+That shield protects against Cancellation specifically, not against Termination, and the distinction is operational. A Cancellation — from the CLI, the Client API, or the Web UI — is a *request*: the Cluster records it and delivers it to the Worker as a Workflow Task, the SDK raises `CancelledError` inside the Workflow, and the shielded compensations still get scheduled and run to completion. A Termination is not cooperative: it closes the Workflow Execution on the server, no Workflow Task is ever delivered, and so the Worker never observes it and runs no Workflow code at all — no compensation fires, and an underwriting slot held at that moment stays reserved until something outside the Workflow releases it. Cancel a Workflow whose Saga needs to unwind; reserve Terminate for one too stuck to cancel, and expect to clean up its side effects by hand.
 
 ```python
     # Saga: reserve the underwriting slot, pull credit, and produce a decision.
@@ -936,7 +1071,11 @@ When the applicant submits the application, `run` calls `_run_decisioning`. Each
                     except Exception as ce:
                         workflow.logger.error(f"compensation failed: {ce}")
 
-            # asyncio.shield runs the compensations even if the Workflow is cancelled.
+            # asyncio.shield lets the compensations finish even if the Workflow is
+            # cancelled mid-Saga: a Cancellation is delivered to the Worker as a
+            # Workflow Task, so shielded code still runs. It cannot help on a
+            # Terminate, which closes the Execution server-side with no Workflow
+            # Task at all — nothing here runs, and compensations are skipped.
             await asyncio.shield(asyncio.ensure_future(_compensate()))
             raise
 ```
@@ -961,10 +1100,11 @@ with workflow.unsafe.imports_passed_through():
         run_decision_engine, notify_applicant, send_reminder,
     )
     from shared.models import (
-        WizardState, WizardData, LoanDecision, LoanStep,
+        WizardState, WizardData, LoanDecision, LoanStep, ApplicationStatus,
         SubmitStepInput, SaveDraftInput, ResolveReviewInput,
     )
     from shared.wizard import STEP_ORDER, validate_step, next_step, coerce_step
+    from shared.search_attributes import LOAN_STATUS, LOAN_USER_ID
 
 ABANDON_AFTER = timedelta(days=7)
 MAX_REMINDERS = 2
@@ -978,7 +1118,7 @@ class LoanApplicationWorkflow:
         # run before run()'s body, so the state it reads must already exist.
         self._state = WizardState(
             application_id="",
-            status="in_progress",
+            status=ApplicationStatus.in_progress,
             current_step=LoanStep.applicant,
             completed_steps=[],
             data=WizardData(),
@@ -991,6 +1131,30 @@ class LoanApplicationWorkflow:
         # a resolve_review Update lands; while None (and status is manual_review)
         # the Workflow stays alive, parked, waiting to be resolved.
         self._resolution: LoanDecision | None = None
+        # The user id (applicant email) last mirrored to the LoanUserId Search
+        # Attribute, so we only upsert when it first appears or changes.
+        self._indexed_user_id: str | None = None
+
+    def _apply_status(self, status: ApplicationStatus) -> None:
+        """Set the lifecycle status AND mirror it to the LoanStatus Search
+        Attribute so reviewers can filter applications by status in the Temporal
+        UI/CLI. The single writer of `self._state.status`, so the queryable state
+        and the indexed attribute can never drift apart."""
+        self._state.status = status
+        # value_set takes the Enum member directly: it is a str, so it encodes to
+        # the plain keyword ("approved", …) the Cluster expects.
+        workflow.upsert_search_attributes([LOAN_STATUS.value_set(status)])
+
+    def _index_user_from_email(self) -> None:
+        """Mirror the applicant's email to the LoanUserId Search Attribute once
+        it is known, so a reviewer can find every application belonging to a
+        person. Idempotent: only upserts when the email first appears or changes,
+        and does nothing until the applicant step carries an email."""
+        applicant = self._state.data.applicant or {}
+        email = applicant.get("email")
+        if email and email != self._indexed_user_id:
+            self._indexed_user_id = email
+            workflow.upsert_search_attributes([LOAN_USER_ID.value_set(email)])
 
     @workflow.run
     async def run(
@@ -1005,6 +1169,11 @@ class LoanApplicationWorkflow:
         # continue-as-new) can run before this body, so its newer write wins.
         self._state.application_id = application_id
         self._state.updated_at = workflow.now().timestamp()
+        # Publish the current status as a Search Attribute from the first Task, so
+        # a fresh application is filterable as in_progress immediately (and a run
+        # resumed via continue-as-new re-affirms it). Search Attributes carry
+        # across continue-as-new, so this is a cheap re-write, not a fix-up.
+        self._apply_status(self._state.status)
         if completed:
             # Union with whatever a handler already recorded, in canonical order.
             resumed = set(self._state.completed_steps) | set(completed)
@@ -1022,6 +1191,8 @@ class LoanApplicationWorkflow:
                     self._state.data, field,
                     incoming if existing is None else {**incoming, **existing},
                 )
+        # A resumed run may carry the applicant email — index it up front.
+        self._index_user_from_email()
 
         # Resumable wait loop with inactivity reminders. The reminder count is
         # carried across continue-as-new (see below), so the abandonment budget
@@ -1045,11 +1216,26 @@ class LoanApplicationWorkflow:
                 if reminders >= MAX_REMINDERS:
                     await workflow.wait_condition(workflow.all_handlers_finished)
                     decision = LoanDecision(
-                        outcome="abandoned", reason="Inactive", reference_id=application_id,
+                        outcome=ApplicationStatus.abandoned, reason="Inactive",
+                        reference_id=application_id,
                     )
-                    self._state.status = "abandoned"
+                    self._apply_status(ApplicationStatus.abandoned)
                     self._state.decision = decision
                     self._state.updated_at = workflow.now().timestamp()
+                    # Tell the applicant the application lapsed, so abandonment
+                    # is announced like every other terminal outcome. Fired
+                    # after the status is applied and outside any Saga: the
+                    # inactivity timer decided this locally, there is nothing to
+                    # roll back, and a failed notification must not unwind a
+                    # terminal state the Query already reports.
+                    await workflow.execute_activity(
+                        notify_applicant, args=[application_id, decision],
+                        start_to_close_timeout=ACT_TIMEOUT,
+                    )
+                    # Awaiting the Activity reopens the window in which a late
+                    # Update or Signal handler can start, so drain once more
+                    # before completing.
+                    await workflow.wait_condition(workflow.all_handlers_finished)
                     return decision
                 reminders += 1
                 email = self._state.data.applicant.get("email") if self._state.data.applicant else None
@@ -1081,17 +1267,17 @@ class LoanApplicationWorkflow:
         if self._withdrawn:
             await workflow.wait_condition(workflow.all_handlers_finished)
             decision = LoanDecision(
-                outcome="withdrawn",
+                outcome=ApplicationStatus.withdrawn,
                 reason=self._withdraw_reason or "Withdrawn by applicant",
                 reference_id=application_id,
             )
-            self._state.status = "withdrawn"
+            self._apply_status(ApplicationStatus.withdrawn)
             self._state.decision = decision
             self._state.updated_at = workflow.now().timestamp()
             return decision
 
         # Submitted, so run the decisioning Saga.
-        self._state.status = "processing"
+        self._apply_status(ApplicationStatus.processing)
         self._state.updated_at = workflow.now().timestamp()
         decision = await self._run_decisioning(application_id)
 
@@ -1109,8 +1295,8 @@ class LoanApplicationWorkflow:
         # updated — an underwriter resolves it with a resolve_review Update (or
         # the applicant withdraws). This is the whole point of the pattern: a
         # long-lived Workflow that is continued and updated while it runs.
-        if decision.outcome == "manual_review":
-            self._state.status = "manual_review"
+        if decision.outcome == ApplicationStatus.manual_review:
+            self._apply_status(ApplicationStatus.manual_review)
             self._state.decision = decision
             self._state.updated_at = workflow.now().timestamp()
             await workflow.wait_condition(
@@ -1118,7 +1304,7 @@ class LoanApplicationWorkflow:
             )
             if self._withdrawn:
                 decision = LoanDecision(
-                    outcome="withdrawn",
+                    outcome=ApplicationStatus.withdrawn,
                     reason=self._withdraw_reason or "Withdrawn by applicant",
                     reference_id=application_id,
                 )
@@ -1135,7 +1321,7 @@ class LoanApplicationWorkflow:
                 start_to_close_timeout=ACT_TIMEOUT,
             )
 
-        self._state.status = decision.outcome
+        self._apply_status(decision.outcome)
         self._state.decision = decision
         self._state.updated_at = workflow.now().timestamp()
 
@@ -1153,6 +1339,7 @@ class LoanApplicationWorkflow:
         current = getattr(self._state.data, draft.step.value) or {}
         partial = coerce_step(draft.step, draft.partial)
         setattr(self._state.data, draft.step.value, {**current, **partial})
+        self._index_user_from_email()
         self._state.updated_at = workflow.now().timestamp()
 
     # Signal: the applicant withdraws.
@@ -1160,7 +1347,7 @@ class LoanApplicationWorkflow:
     def withdraw(self, reason: str | None = None) -> None:
         self._withdrawn = True
         self._withdraw_reason = reason
-        self._state.status = "withdrawn"
+        self._apply_status(ApplicationStatus.withdrawn)
         self._state.updated_at = workflow.now().timestamp()
 
     # Update: submit a step, validated and synchronous.
@@ -1170,6 +1357,7 @@ class LoanApplicationWorkflow:
         if inp.step not in self._state.completed_steps:
             self._state.completed_steps.append(inp.step)
         self._state.current_step = next_step(inp.step) or inp.step
+        self._index_user_from_email()
         self._state.updated_at = workflow.now().timestamp()
         return self._state
 
@@ -1187,7 +1375,7 @@ class LoanApplicationWorkflow:
     @workflow.update
     async def submit_application(self) -> WizardState:
         self._submitted = True
-        self._state.status = "submitted"
+        self._apply_status(ApplicationStatus.submitted)
         self._state.updated_at = workflow.now().timestamp()
         return self._state
 
@@ -1220,7 +1408,7 @@ class LoanApplicationWorkflow:
     @resolve_review.validator
     def _validate_resolve_review(self, inp: ResolveReviewInput) -> None:
         # Validators must be read-only: no Activities, no sleeps, no changes. Raise to reject.
-        if self._state.status != "manual_review" or self._resolution is not None:
+        if self._state.status != ApplicationStatus.manual_review or self._resolution is not None:
             raise ApplicationError(
                 "Application is not awaiting manual review",
                 {"status": self._state.status},
@@ -1269,7 +1457,11 @@ class LoanApplicationWorkflow:
                     except Exception as ce:
                         workflow.logger.error(f"compensation failed: {ce}")
 
-            # asyncio.shield runs the compensations even if the Workflow is cancelled.
+            # asyncio.shield lets the compensations finish even if the Workflow is
+            # cancelled mid-Saga: a Cancellation is delivered to the Worker as a
+            # Workflow Task, so shielded code still runs. It cannot help on a
+            # Terminate, which closes the Execution server-side with no Workflow
+            # Task at all — nothing here runs, and compensations are skipped.
             await asyncio.shield(asyncio.ensure_future(_compensate()))
             raise
 ```
@@ -1289,11 +1481,31 @@ Workflow code — so it has no bearing on the Workflow sandbox.
 ```python
 # shared/temporal.py
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from temporalio.common import SearchAttributeIndexedValueType
 from temporalio.contrib.pydantic import pydantic_data_converter
 
+from shared.search_attributes import ALL as SEARCH_ATTRIBUTES
+
+if TYPE_CHECKING:
+    from temporalio.client import Client
+
 TASK_QUEUE = "loan-applications"
+
+# Map the SDK's indexed-value-type enum to the operator-service proto enum name
+# used when registering an attribute. Only the types this app uses need an entry;
+# an unmapped type raises in register_search_attributes() rather than registering
+# the wrong type silently.
+_PROTO_INDEXED_TYPE = {
+    SearchAttributeIndexedValueType.KEYWORD: "INDEXED_VALUE_TYPE_KEYWORD",
+    SearchAttributeIndexedValueType.TEXT: "INDEXED_VALUE_TYPE_TEXT",
+    SearchAttributeIndexedValueType.INT: "INDEXED_VALUE_TYPE_INT",
+    SearchAttributeIndexedValueType.DOUBLE: "INDEXED_VALUE_TYPE_DOUBLE",
+    SearchAttributeIndexedValueType.BOOL: "INDEXED_VALUE_TYPE_BOOL",
+    SearchAttributeIndexedValueType.DATETIME: "INDEXED_VALUE_TYPE_DATETIME",
+    SearchAttributeIndexedValueType.KEYWORD_LIST: "INDEXED_VALUE_TYPE_KEYWORD_LIST",
+}
 
 
 def address() -> str:
@@ -1319,9 +1531,72 @@ def connect_kwargs() -> dict[str, Any]:
     elif os.environ.get("TEMPORAL_TLS", "").lower() in {"1", "true", "yes"}:
         kwargs["tls"] = True
     return kwargs
+
+
+async def register_search_attributes(client: "Client") -> list[str]:
+    """Ensure this app's custom Search Attributes exist on the Cluster.
+
+    Custom attributes must be registered before a Workflow can upsert them —
+    upserting an unregistered attribute fails the Workflow Task and retries
+    forever — so the Worker calls this at startup and the tests call it against
+    their ephemeral servers. Idempotent: existing attributes are left alone and
+    only the missing ones are added, so it is safe to run on every boot. Returns
+    the names that were newly registered (empty if all present).
+
+    On a locked-down Cluster (e.g. Temporal Cloud) the account may lack
+    permission to add attributes; register them once out-of-band with
+    `temporal operator search-attribute create` and this call is a no-op.
+    """
+    from temporalio.api.enums.v1 import IndexedValueType
+    from temporalio.api.operatorservice.v1 import (
+        AddSearchAttributesRequest,
+        ListSearchAttributesRequest,
+    )
+    from temporalio.service import RPCError, RPCStatusCode
+
+    namespace = os.environ.get("TEMPORAL_NAMESPACE", "default")
+
+    # List first so we only add what's missing. The time-skipping test server
+    # doesn't implement ListSearchAttributes; there, skip the diff and attempt to
+    # add every attribute, tolerating an already-exists error below.
+    try:
+        existing = await client.operator_service.list_search_attributes(
+            ListSearchAttributesRequest(namespace=namespace)
+        )
+        present = set(existing.custom_attributes.keys())
+    except RPCError as e:
+        if e.status != RPCStatusCode.UNIMPLEMENTED:
+            raise
+        present = set()
+
+    to_add: dict[str, Any] = {}
+    for key in SEARCH_ATTRIBUTES:
+        if key.name in present:
+            continue
+        proto_name = _PROTO_INDEXED_TYPE.get(key.indexed_value_type)
+        if proto_name is None:
+            raise ValueError(
+                f"Search attribute {key.name!r} has unsupported type "
+                f"{key.indexed_value_type!r}; add it to _PROTO_INDEXED_TYPE."
+            )
+        to_add[key.name] = IndexedValueType.Value(proto_name)
+
+    if not to_add:
+        return []
+    try:
+        await client.operator_service.add_search_attributes(
+            AddSearchAttributesRequest(namespace=namespace, search_attributes=to_add)
+        )
+    except RPCError as e:
+        # A concurrent Worker (or a Cluster where listing wasn't possible) may
+        # have registered them already — that's success, not an error.
+        if e.status != RPCStatusCode.ALREADY_EXISTS:
+            raise
+        return []
+    return list(to_add)
 ```
 
-The Worker registers the Workflow and the Activities and connects with the Pydantic data converter. Sync Activities run on a thread pool.
+The Worker registers the Workflow and the Activities and connects with the Pydantic data converter. Sync Activities run on a thread pool. It also registers the custom Search Attributes at startup — idempotently, so a fresh development server just works — before it begins polling, so the first upsert always lands on an attribute the Cluster already knows.
 
 ```python
 # worker.py
@@ -1332,11 +1607,23 @@ from temporalio.worker import Worker
 
 from workflows.loan_application import LoanApplicationWorkflow
 from activities import loan_activities
-from shared.temporal import TASK_QUEUE, address, connect_kwargs
+from shared.temporal import (
+    TASK_QUEUE,
+    address,
+    connect_kwargs,
+    register_search_attributes,
+)
 
 
 async def main() -> None:
     client = await Client.connect(address(), **connect_kwargs())
+    # Custom Search Attributes must exist before the Workflow upserts them, or
+    # every Task fails and retries forever. Registering here (idempotent) means a
+    # fresh local dev server just works; on a locked-down Cluster the attributes
+    # are pre-registered out-of-band and this is a no-op.
+    registered = await register_search_attributes(client)
+    if registered:
+        print(f"Registered Search Attributes: {', '.join(registered)}")
     with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
         worker = Worker(
             client,
@@ -1514,7 +1801,7 @@ export function Wizard({ applicationId }: { applicationId: string }) {
   const submitApplication = async () => {
     const res = await fetch(`/api/applications/${applicationId}/submit`, { method: 'POST' });
     setState(await res.json());
-    // Then poll GET until status is terminal (approved or rejected). A
+    // Then poll GET (no more than once a second) until status is terminal. A
     // manual_review status is not terminal: the Workflow stays running,
     // parked, so keep polling — an underwriter resolves it below.
   };
@@ -1536,6 +1823,8 @@ export function Wizard({ applicationId }: { applicationId: string }) {
 
 The component holds no durable state of its own. 
 It reads from the Workflow and writes through the primitives, so a refresh restores the wizard from the Query.
+
+Keep any auto-refresh deliberate, though: a Query is answered by a live Worker rather than from a cache or a read replica, and on Temporal Cloud every Query is a billable Action, so refresh volume is Worker load multiplied by every open tab. Do not Query the same application more than once a second, and only poll while the interface is waiting on something the applicant cannot cause — the decisioning Saga after submit, or an underwriter resolving a `manual_review` — backing off and stopping once the status is terminal.
 
 ### Run the pattern
 
@@ -1568,8 +1857,14 @@ temporal workflow signal --workflow-id loan-application-demo --name withdraw
 temporal workflow update execute --workflow-id loan-application-demo \
   --name resolve_review \
   --input '{"outcome":"approved","note":"Verified income documents"}'
+
+# Find applications by state or by applicant, the way a reviewer would — the same
+# filters work in the Web UI's search bar. The Worker registers LoanStatus and
+# LoanUserId at startup:
+temporal workflow list --query 'LoanStatus="manual_review"'
+temporal workflow list --query 'LoanUserId="ada@example.com"'
 ```
-Use your browser to view the Temporal Web UI at http://localhost:8233 to observe the Event History after running the commands.
+Use your browser to view the Temporal Web UI at http://localhost:8233 to observe the Event History after running the commands, and to filter applications by `LoanStatus` and `LoanUserId` in its search bar.
 
 ## Outcomes
 
@@ -1580,12 +1875,15 @@ By following this implementation plan, you have built a resumable, multi-step wi
 - Decide whether each applicant action should be an Update, a Query, or a Signal, based on whether it needs a validated reply, a read of current state, or fire-and-forget delivery.
 - Define the contracts once with Pydantic, reused across the FastAPI boundary and the Temporal data converter.
 - Observe the full lifecycle of an application, including start, each step, submission, and the decisioning Saga, as one Event History in the Temporal Web UI.
+- Find applications across every open Workflow by state and by applicant, using the `LoanStatus` and `LoanUserId` custom Search Attributes the Workflow keeps current.
 - Run the same code locally or on Temporal Cloud through environment variables, with mocked, idempotent Activities.
 
 ## Related resources
 - [Source Code](https://github.com/temporal-sa/loan-wizard)
 - [Temporal documentation on workflow message passing](https://docs.temporal.io/encyclopedia/workflow-message-passing) covers how Signals, Queries, and Updates send data to and read state from a running Workflow.
 - [Temporal documentation on Continue-As-New](https://docs.temporal.io/workflow-execution/continue-as-new) explains how to keep Event History bounded on long-lived Workflows.
+- [Temporal documentation on Search Attributes](https://docs.temporal.io/visibility#search-attribute) explains how to register, upsert, and query custom attributes to find Workflows by their business state.
+- [Temporal Cloud Actions](https://docs.temporal.io/cloud/actions) is the list of billable operations, including one Action for every Query — what sizes the cost of an auto-refresh loop.
 - [Temporal blog post on the Saga pattern](https://temporal.io/blog/saga-pattern-made-easy) shows how to model compensations for a multi-step process inside a Workflow.
 - [Temporal documentation on testing Python Workflows](https://docs.temporal.io/develop/python/best-practices/testing-suite) describes the test environment, time-skipping, and the Replayer for determinism checks.
 - [Codecs and encryption](https://docs.temporal.io/production-deployment/data-encryption) and the [Codec Server](https://docs.temporal.io/codec-server) explain how to encrypt Payloads at rest in the Event History and still decode them for authorized viewing. This is to protect the PII this wizard collects (see the Production note under [Define the shared models](#define-the-shared-models)).

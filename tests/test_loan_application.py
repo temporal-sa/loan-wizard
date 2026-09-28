@@ -21,6 +21,7 @@ from temporalio.worker import Replayer, Worker
 
 from activities import loan_activities
 from shared.models import (
+    LoanDecision,
     LoanStep,
     ResolveReviewInput,
     SaveDraftInput,
@@ -196,10 +197,15 @@ async def test_withdraw_ends_as_withdrawn(client):
 
 async def test_inactivity_sends_reminders_then_abandons():
     reminders: list[str] = []
+    notified: list[tuple[str, str]] = []
 
     @activity.defn(name="send_reminder")
     def counting_send_reminder(application_id: str, email: str | None) -> None:
         reminders.append(application_id)
+
+    @activity.defn(name="notify_applicant")
+    def recording_notify(application_id: str, decision: LoanDecision) -> None:
+        notified.append((application_id, decision.outcome))
 
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
@@ -210,7 +216,7 @@ async def test_inactivity_sends_reminders_then_abandons():
                 env.client,
                 task_queue=TASK_QUEUE,
                 workflows=[LoanApplicationWorkflow],
-                activities=[counting_send_reminder],
+                activities=[counting_send_reminder, recording_notify],
                 activity_executor=executor,
             ):
                 handle = await env.client.start_workflow(
@@ -227,6 +233,9 @@ async def test_inactivity_sends_reminders_then_abandons():
     assert len(reminders) == 2  # MAX_REMINDERS, then abandon on the next timeout
     assert state.status == "abandoned"
     assert state.decision is not None and state.decision.outcome == "abandoned"
+    # Abandonment is announced, not silent: exactly one notification, carrying
+    # the abandoned outcome, so the applicant learns the application lapsed.
+    assert notified == [("app-t5", "abandoned")]
 
 
 # --- T6: decision engine failure triggers Saga compensation ----------------
@@ -300,10 +309,15 @@ async def test_carried_reminder_count_is_honored_after_continue_as_new():
     reminders all over again.
     """
     reminders_sent: list[str] = []
+    notified: list[str] = []
 
     @activity.defn(name="send_reminder")
     def counting_send_reminder(application_id: str, email: str | None) -> None:
         reminders_sent.append(application_id)
+
+    @activity.defn(name="notify_applicant")
+    def recording_notify(application_id: str, decision: LoanDecision) -> None:
+        notified.append(decision.outcome)
 
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
@@ -314,7 +328,7 @@ async def test_carried_reminder_count_is_honored_after_continue_as_new():
                 env.client,
                 task_queue=TASK_QUEUE,
                 workflows=[LoanApplicationWorkflow],
-                activities=[counting_send_reminder],
+                activities=[counting_send_reminder, recording_notify],
                 activity_executor=executor,
             ):
                 handle = await env.client.start_workflow(
@@ -328,6 +342,7 @@ async def test_carried_reminder_count_is_honored_after_continue_as_new():
 
     assert decision.outcome == "abandoned"
     assert reminders_sent == []  # budget already spent: abandons, no new reminders
+    assert notified == ["abandoned"]  # still notified, even with no reminders left
 
 
 # --- T7: busy autosave path continues-as-new before the reminder tick --------
